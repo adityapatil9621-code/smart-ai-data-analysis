@@ -1,341 +1,178 @@
+"""
+data_cleaning.py
+
+Data Cleaning Layer for Smart AI Data Intelligence System.
+
+Features:
+- Intelligent missing handling
+- Safe datetime detection
+- Duplicate removal
+- Identifier detection
+- Outlier capping
+- Data quality scoring
+"""
+
 import pandas as pd
 import numpy as np
-
-# =========================================
-# GLOBAL CONFIG
-# =========================================
-SAFE_MODE = True   # If True, preserves missing values when imputation may bias analysis
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List
 
 
-# =========================================
-# SEMANTIC ROLE DETECTION
-# =========================================
-def detect_column_role(col_name, dtype):
-    name = col_name.lower()
+# ============================================================
+# Cleaned Data Object
+# ============================================================
 
-    if "id" in name:
-        return "identifier"
-    if "age" in name:
-        return "age"
-    if any(k in name for k in ["salary", "amount", "price", "cost"]):
-        return "monetary"
-    if np.issubdtype(dtype, np.number):
-        return "numeric"
-    if dtype == object:
-        return "categorical"
-    if np.issubdtype(dtype, np.datetime64):
-        return "datetime"
+@dataclass
+class CleanedDataObject:
+    cleaned_df: pd.DataFrame
+    quality_score: float
+    identifiers: List[str]
 
-    return "unknown"
-
-
-# =========================================
-# MAIN CLEANING FUNCTION
-# =========================================
-def clean_data(df):
-    cleaned_df = df.copy()
-    csv_data = cleaned_df.to_csv(index=False).encode("utf-8")
-
-    explanation = []
-    warnings = []
-    impact_report = {}
-
-    total_rows = len(cleaned_df)
-
-    # =====================================
-    # 1️⃣ DUPLICATE REMOVAL
-    # =====================================
-    dup_count = cleaned_df.duplicated().sum()
-    if dup_count > 0:
-        cleaned_df = cleaned_df.drop_duplicates()
-        explanation.append(
-            f"Removed {dup_count} duplicate rows to prevent statistical bias."
-        )
-
-    # =====================================
-    # 2️⃣ COLUMN-WISE INTELLIGENT CLEANING
-    # =====================================
-    for col in cleaned_df.columns:
-
-        missing_before = cleaned_df[col].isna().sum()
-        missing_ratio = missing_before / total_rows
-        dtype = cleaned_df[col].dtype
-        role = detect_column_role(col, dtype)
-
-        impact_report[col] = {
-            "role": role,
-            "missing_before": int(missing_before),
-            "values_modified": 0,
-            "action": None,
-            "confidence": None
+    def to_dict(self):
+        return {
+            "quality_score": self.quality_score,
+            "identifiers": self.identifiers
         }
 
-        if missing_before == 0:
-            impact_report[col]["confidence"] = "High"
-            continue
 
-        # =================================
-        # IDENTIFIERS → NEVER IMPUTE
-        # =================================
-        if role == "identifier":
-            explanation.append(
-                f"Column '{col}' identified as identifier → missing values preserved."
-            )
-            impact_report[col]["action"] = "preserved_missing"
-            impact_report[col]["confidence"] = "High"
-            continue
+# ============================================================
+# Data Cleaning Engine
+# ============================================================
 
-        # =================================
-        # AGE (DOMAIN-CONSTRAINED)
-        # =================================
-        if role == "age":
-            median_age = round(cleaned_df[col].median())
-            new_col = cleaned_df[col].fillna(median_age)
+class DataCleaningEngine:
 
-            # Enforce real-world constraints
-            new_col = new_col.clip(lower=0, upper=120).astype(int)
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
 
-            impact_report[col]["values_modified"] = int(
-                new_col.ne(cleaned_df[col]).sum()
-            )
+    # ========================================================
+    # MAIN RUN
+    # ========================================================
 
-            cleaned_df[col] = new_col
+    def run(self, df: pd.DataFrame) -> CleanedDataObject:
 
-            explanation.append(
-                f"Column '{col}' treated as Age → median imputation, integer enforced, valid range applied."
-            )
+        df = df.copy()
 
-            impact_report[col]["action"] = "median_int_domain_enforced"
-            impact_report[col]["confidence"] = "High"
-            continue
+        initial_rows = len(df)
 
-        # =================================
-        # MONETARY VALUES
-        # =================================
-        if role == "monetary":
-            skew = cleaned_df[col].skew()
-            q1 = cleaned_df[col].quantile(0.25)
-            q3 = cleaned_df[col].quantile(0.75)
-            iqr = q3 - q1
-            outliers = ((cleaned_df[col] < q1 - 1.5 * iqr) |
-                        (cleaned_df[col] > q3 + 1.5 * iqr)).sum()
+        # ----------------------------------------------------
+        # 1️⃣ Remove Duplicates
+        # ----------------------------------------------------
+        df = df.drop_duplicates()
 
-            fill_value = cleaned_df[col].median()
-            new_col = cleaned_df[col].fillna(fill_value)
+        # ----------------------------------------------------
+        # 2️⃣ Safe Type Correction
+        # ----------------------------------------------------
+        df = self._correct_types(df)
 
-            impact_report[col]["values_modified"] = int(
-                new_col.ne(cleaned_df[col]).sum()
-            )
+        # ----------------------------------------------------
+        # 3️⃣ Missing Value Handling
+        # ----------------------------------------------------
+        df = self._handle_missing(df)
 
-            cleaned_df[col] = new_col
+        # ----------------------------------------------------
+        # 4️⃣ Outlier Capping
+        # ----------------------------------------------------
+        df = self._handle_outliers(df)
 
-            explanation.append(
-                f"Column '{col}' treated as monetary → median used "
-                f"(skew={round(skew,2)}, outliers={outliers}) to reduce distortion."
-            )
+        # ----------------------------------------------------
+        # 5️⃣ Identifier Detection
+        # ----------------------------------------------------
+        identifiers = [
+            col for col in df.columns
+            if "id" in col.lower()
+        ]
 
-            impact_report[col]["action"] = "median_outlier_safe"
-            impact_report[col]["confidence"] = "High"
-            continue
+        # ----------------------------------------------------
+        # 6️⃣ Data Quality Score
+        # ----------------------------------------------------
+        missing_ratio = df.isna().mean().mean()
+        duplicate_ratio = (initial_rows - len(df)) / max(initial_rows, 1)
 
-        # =================================
-        # GENERIC NUMERIC
-        # =================================
-        if role == "numeric":
-            if missing_ratio < 0.05:
-                value = cleaned_df[col].mean()
-                method = "mean"
-                confidence = "High"
-            else:
-                value = cleaned_df[col].median()
-                method = "median"
-                confidence = "Medium"
+        quality_score = 1 - (0.5 * missing_ratio + 0.5 * duplicate_ratio)
+        quality_score = round(float(max(0, min(1, quality_score))), 3)
 
-            new_col = cleaned_df[col].fillna(value)
+        return CleanedDataObject(
+            cleaned_df=df,
+            quality_score=quality_score,
+            identifiers=identifiers
+        )
 
-            impact_report[col]["values_modified"] = int(
-                new_col.ne(cleaned_df[col]).sum()
-            )
+    # ========================================================
+    # Type Correction
+    # ========================================================
 
-            cleaned_df[col] = new_col
+    def _correct_types(self, df: pd.DataFrame) -> pd.DataFrame:
 
-            explanation.append(
-                f"Column '{col}' numeric → filled using {method}."
-            )
+        for col in df.columns:
 
-            impact_report[col]["action"] = method
-            impact_report[col]["confidence"] = confidence
-            continue
+            # Try numeric conversion
+            if df[col].dtype == "object":
 
-        # =================================
-        # CATEGORICAL / BEHAVIORAL
-        # =================================
-        if role == "categorical":
+                numeric_conversion = pd.to_numeric(df[col], errors="coerce")
 
-            # LOW MISSING
-            if missing_ratio < 0.10:
-                value = cleaned_df[col].mode().iloc[0]
-                new_col = cleaned_df[col].fillna(value)
+                if numeric_conversion.notna().sum() > 0.8 * len(df):
+                    df[col] = numeric_conversion
+                    continue
 
-                impact_report[col]["values_modified"] = int(
-                    new_col.ne(cleaned_df[col]).sum()
-                )
+                # Try datetime detection safely
+                sample_values = df[col].dropna().astype(str).head(5)
 
-                cleaned_df[col] = new_col
+                if any(('-' in val or '/' in val) for val in sample_values):
 
-                explanation.append(
-                    f"Column '{col}' categorical → filled using mode ('{value}')."
-                )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
 
-                impact_report[col]["action"] = "mode"
-                impact_report[col]["confidence"] = "High"
-
-            # MODERATE MISSING
-            elif 0.10 <= missing_ratio <= 0.30:
-                numeric_cols = cleaned_df.select_dtypes(include=np.number).columns
-
-                if len(numeric_cols) > 0:
-                    ref_col = numeric_cols[0]
-
-                    new_col = cleaned_df.groupby(
-                        pd.qcut(cleaned_df[ref_col], 4, duplicates="drop"),
-                        observed=True
-                    )[col].transform(
-                        lambda x: x.fillna(x.mode().iloc[0] if not x.mode().empty else x)
-                    )
-
-                    impact_report[col]["values_modified"] = int(
-                        new_col.ne(cleaned_df[col]).sum()
-                    )
-
-                    cleaned_df[col] = new_col
-
-                    explanation.append(
-                        f"Column '{col}' categorical → conditional mode applied to preserve behavior."
-                    )
-
-                    impact_report[col]["action"] = "conditional_mode"
-                    impact_report[col]["confidence"] = "Medium"
-                else:
-                    if SAFE_MODE:
-                        warnings.append(
-                            f"Column '{col}' has moderate missing values but no numeric reference → values preserved."
+                        converted = pd.to_datetime(
+                            df[col],
+                            errors="coerce",
+                            infer_datetime_format=True
                         )
-                        impact_report[col]["action"] = "preserved_missing"
-                        impact_report[col]["confidence"] = "Low"
-                    else:
-                        new_col = cleaned_df[col].fillna("Unknown")
-                        impact_report[col]["values_modified"] = int(
-                            new_col.ne(cleaned_df[col]).sum()
-                        )
-                        cleaned_df[col] = new_col
-                        impact_report[col]["action"] = "unknown_fallback"
-                        impact_report[col]["confidence"] = "Low"
 
-            # HIGH MISSING
-            else:
-                warnings.append(
-                    f"Column '{col}' has high missing ratio ({round(missing_ratio*100,1)}%). "
-                    f"Imputation skipped to avoid analytical bias."
-                )
-                impact_report[col]["action"] = "preserved_missing"
-                impact_report[col]["confidence"] = "Low"
+                    if converted.notna().sum() > 0.8 * len(df):
+                        df[col] = converted
 
-            continue
+        return df
 
-        # =================================
-        # DATETIME
-        # =================================
-        if role == "datetime":
-            new_col = cleaned_df[col].fillna(method="ffill")
+    # ========================================================
+    # Missing Handling
+    # ========================================================
 
-            impact_report[col]["values_modified"] = int(
-                new_col.ne(cleaned_df[col]).sum()
-            )
+    def _handle_missing(self, df: pd.DataFrame) -> pd.DataFrame:
 
-            cleaned_df[col] = new_col
+        numeric_cols = df.select_dtypes(include=np.number).columns
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns
 
-            explanation.append(
-                f"Column '{col}' datetime → forward fill applied for temporal continuity."
-            )
+        for col in numeric_cols:
+            df[col] = df[col].fillna(df[col].median())
 
-            impact_report[col]["action"] = "forward_fill"
-            impact_report[col]["confidence"] = "Medium"
+        for col in categorical_cols:
+            df[col] = df[col].fillna("Unknown")
 
-    explanation.append("Real-world intelligent data cleaning completed.")
-    return cleaned_df, explanation, warnings, impact_report
-def compute_data_quality_score(impact_report, total_rows):
-    column_scores = {}
-    total_score = 0
+        return df
 
-    for col, info in impact_report.items():
-        score = 100
+    # ========================================================
+    # Outlier Handling
+    # ========================================================
 
-        missing_ratio = info["missing_before"] / total_rows
-        modified_ratio = info["values_modified"] / total_rows
+    def _handle_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
 
-        # Missing data penalties
-        if missing_ratio > 0.30:
-            score -= 30
-        elif 0.10 <= missing_ratio <= 0.30:
-            score -= 15
+        numeric_cols = df.select_dtypes(include=np.number).columns
 
-        # Modification penalty
-        if modified_ratio > 0.20:
-            score -= 20
+        # Ensure float for safe replacement
+        df[numeric_cols] = df[numeric_cols].astype(float)
 
-        # Action-based penalty
-        if info["action"] in ["preserved_missing"]:
-            score -= 15
+        for col in numeric_cols:
 
-        # Confidence-based penalty
-        if info["confidence"] == "Low":
-            score -= 10
-        elif info["confidence"] == "Medium":
-            score -= 5
+            mean = df[col].mean()
+            std = df[col].std()
 
-        column_scores[col] = max(score, 0)
-        total_score += column_scores[col]
+            if std == 0:
+                continue
 
-    dataset_score = round(total_score / len(column_scores), 2)
-    return column_scores, dataset_score
-def compute_drift_metrics(before_df, after_df):
-    drift_report = {}
+            z_scores = (df[col] - mean) / std
 
-    for col in before_df.columns:
-        if col not in after_df.columns:
-            continue
+            df.loc[z_scores > 3, col] = mean + 3 * std
+            df.loc[z_scores < -3, col] = mean - 3 * std
 
-        # Numeric drift
-        if pd.api.types.is_numeric_dtype(before_df[col]):
-            before_mean = before_df[col].mean()
-            after_mean = after_df[col].mean()
-
-            before_std = before_df[col].std()
-            after_std = after_df[col].std()
-
-            drift_report[col] = {
-                "mean_change_%": None if before_mean == 0 else round(
-                    ((after_mean - before_mean) / before_mean) * 100, 2
-                ),
-                "std_change_%": None if before_std == 0 else round(
-                    ((after_std - before_std) / before_std) * 100, 2
-                )
-            }
-
-        # Categorical drift
-        elif before_df[col].dtype == object:
-            before_dist = before_df[col].value_counts(normalize=True)
-            after_dist = after_df[col].value_counts(normalize=True)
-
-            categories = set(before_dist.index).union(after_dist.index)
-            drift = sum(
-                abs(before_dist.get(cat, 0) - after_dist.get(cat, 0))
-                for cat in categories
-            )
-
-            drift_report[col] = {
-                "distribution_drift": round(drift, 3)
-            }
-
-    return drift_report
+        return df
